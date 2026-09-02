@@ -139,8 +139,11 @@ const server = http.createServer(async (req, res) => {
       const model = body.model || 'gemini-flash-latest';
       const gemBody = openAIToGemini(body);
       const stream = !!body.stream;
-      const method = stream ? 'streamGenerateContent?alt=sse' : 'generateContent';
-      const target = `https://${GL_HOST}/v1beta/models/${encodeURIComponent(model)}:${method}&key=${encodeURIComponent(key)}`;
+      const method = stream ? 'streamGenerateContent' : 'generateContent';
+      const targetUrl = new URL(`https://${GL_HOST}/v1beta/models/${encodeURIComponent(model)}:${method}`);
+      targetUrl.searchParams.set('key', key);
+      if (stream) targetUrl.searchParams.set('alt', 'sse');
+      const target = targetUrl.toString();
 
       const upstream = await fetch(target, {
         method: 'POST',
