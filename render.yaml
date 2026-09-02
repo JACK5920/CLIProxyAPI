@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: google-proxy
+    env: docker
+    region: oregon # 锁定美国俄勒冈机房
+    plan: free
+    dockerfilePath: ./Dockerfile
