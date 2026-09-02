@@ -13,6 +13,44 @@
 
 ---
 
+## 🗂️ 项目源码与扩展文件结构对照表
+
+本仓库严格遵循“核心代码 0 污染、外围扩展独立并存”的工程原则，项目整体目录结构对照如下：
+
+```text
+JACK5920/CLIProxyAPI/
+├── 📁 原生 CLIProxyAPI 核心体系 (100% 原始纯净，未改动任何一行代码)
+│   ├── cmd/                    # Go 命令行入口 (server, fetch_models 等)
+│   ├── internal/               # 核心业务逻辑 (api, auth, runtime, store, watcher 等)
+│   ├── sdk/                    # 外部可嵌入的 CLIProxy SDK 库
+│   ├── test/                   # 原生全量测试用例集
+│   ├── config.example.yaml     # 官方配置模版文件
+│   └── Dockerfile              # 原生 Go 服务的官方多阶段构建镜像文件
+│
+└── ⭐ 云端网关扩展体系 (本次新增的 5 个独立配置文件，互不干扰)
+    ├── vercel.json             # [新增] Vercel 路由劫持配置文件
+    ├── render.yaml             # [新增] Render 蓝图 Blueprint 自动部署描述
+    ├── Dockerfile.render       # [新增] Render 轻量 Node.js 镜像配置 (与原生 Dockerfile 彻底隔离)
+    ├── render-server.mjs       # [新增] Render 四协议自适应网关服务源码 (Node.js)
+    ├── GATEWAY_EXTENSION_README.md # [新增] 本扩展完整说明与全场景决策对照文档
+    └── api/
+        └── proxy.js            # [新增] Vercel Edge 边缘函数四协议自适应网关源码 (V8 Runtime)
+```
+
+### 结构角色与状态对照：
+
+| 文件 / 目录 | 所属体系 | 修改状态 | 运行平台 | 核心职责与作用 |
+| :--- | :--- | :---: | :--- | :--- |
+| `cmd/`、`internal/`、`sdk/` | 原生项目 | ⚪ **未改动 (0 修改)** | Windows / Linux 本地 | 负责处理本地复杂的 OAuth 登录授权、凭证定时刷新与高并发反重力账号调度 |
+| `Dockerfile` | 原生项目 | ⚪ **未改动 (0 修改)** | 本地 / 服务器 Docker | 原生 CLIProxyAPI 服务端的容器编译配置 |
+| `vercel.json` | 扩展网关 | 🟢 **全新增加** | Vercel 云端 | 定义 Vercel 平台路由重写规则，将所有公网请求导流至 `api/proxy.js` |
+| `api/proxy.js` | 扩展网关 | 🟢 **全新增加** | Vercel Edge (sfo1) | 运行在 Vercel 边缘节点上的四协议智能转换与流式 SSE 转发核心代码 |
+| `render.yaml` | 扩展网关 | 🟢 **全新增加** | Render 平台 | Render 一键蓝图规范，自动锁定美国俄勒冈机房并指定使用 `Dockerfile.render` |
+| `Dockerfile.render` | 扩展网关 | 🟢 **全新增加** | Render Docker | 基于轻量 `node:20-alpine` 构建，确保与根目录原生 Go Dockerfile 互不冲突 |
+| `render-server.mjs` | 扩展网关 | 🟢 **全新增加** | Render 独立容器 | Node.js 原生 HTTP 双工网关，负责在 Render 容器内执行四协议转换 |
+
+---
+
 ## 📊 场景决策与方案结果对照表
 
 小码酱基于全链路实测抓取数据，汇总出以下**全场景选择与功能对照表**，方便在不同场景下直接对号入座：
@@ -35,19 +73,6 @@
 | **Vercel** (`*.vercel.app`) | **~1067 ms** | **690 ms** | 🟢 **极稳**，Anycast 全球 CDN，零冷启动秒开 | ⭐⭐⭐⭐⭐ (首选) |
 | **Render** (`*.onrender.com`) | **~1657 ms** | **750 ms** | 🟢 **较好**，独立机房出口；免费版带休眠机制 | ⭐⭐⭐⭐☆ (备用) |
 | **Koyeb** (`*.koyeb.app`) | **~5200 ms** | **2309 ms** | 🔴 **卡顿**，国内路由跳数多，常有 7~8 秒长等待 | ⭐☆☆☆☆ (不推荐) |
-
----
-
-## 📁 新增文件清单与职责
-
-| 文件路径 | 运行环境 | 功能职责 |
-| :--- | :--- | :--- |
-| `vercel.json` | Vercel | Vercel 平台的路由重写配置，捕获所有端点请求指向 Edge 函数 |
-| `api/proxy.js` | Vercel Edge | Vercel 边缘函数核心代码，基于 V8 运行时，原生支持流式 SSE 打字输出 |
-| `render.yaml` | Render | Render 蓝图（Blueprint）自动部署规范文件，声明部署地区（Oregon）与规格 |
-| `Dockerfile.render` | Render Docker | 基于轻量 `node:20-alpine` 的容器镜像配置，与原生 Go Dockerfile 完全隔离 |
-| `render-server.mjs` | Render Container | Node.js 原生 HTTP 双工网关服务，支持长连接与流式协议转换 |
-| `GATEWAY_EXTENSION_README.md` | 文档 | 本扩展功能与多场景结果对照完整说明文档 |
 
 ---
 
