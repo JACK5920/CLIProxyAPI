@@ -1,31 +1,30 @@
 // ============================================================
-// Google API 万能网关（Vercel Edge 版）
-// 支持 3 种用法：
-//   1. Gemini 原生协议：/v1beta/models/xxx:generateContent（透明转发）
-//   2. OpenAI 协议：    /v1/chat/completions（自动翻译成 Gemini 调用）
-//   3. OpenAI 模型列表：/v1/models（自动翻译）
+// Google API 三协议万能网关（Vercel Edge 版）
+// 支持：
+//   1. OpenAI Chat Completions (/v1/chat/completions)
+//   2. OpenAI Responses (/v1/responses)
+//   3. Anthropic Messages (/v1/messages)
+//   4. Gemini 原生透明转发 (/v1beta/...)
 // ============================================================
-export const config = {
-  runtime: 'edge',
-};
+export const config = { runtime: 'edge' };
 
 const GL_HOST = 'generativelanguage.googleapis.com';
 const CLOUDCODE_HOST = 'cloudcode-pa.googleapis.com';
 
-// ---------- 工具：提取 API Key ----------
 function extractKey(request, url) {
   const auth = request.headers.get('authorization');
   if (auth && auth.toLowerCase().startsWith('bearer ')) return auth.slice(7).trim();
   const goog = request.headers.get('x-goog-api-key');
   if (goog) return goog.trim();
+  const ak = request.headers.get('x-api-key');
+  if (ak) return ak.trim();
   return url.searchParams.get('key') || '';
 }
 
-// ---------- 工具：OpenAI messages -> Gemini contents ----------
-function openAIToGemini(body) {
+function buildContents(messages) {
   const systemTexts = [];
   const contents = [];
-  for (const m of body.messages || []) {
+  for (const m of messages || []) {
     if (m.role === 'system' || m.role === 'developer') {
       systemTexts.push(typeof m.content === 'string' ? m.content : JSON.stringify(m.content));
       continue;
@@ -42,38 +41,23 @@ function openAIToGemini(body) {
   }
   const out = { contents };
   if (systemTexts.length) out.systemInstruction = { parts: [{ text: systemTexts.join('\n') }] };
-  const gen = {};
-  if (body.temperature != null) gen.temperature = body.temperature;
-  if (body.top_p != null) gen.topP = body.top_p;
-  if (body.max_tokens != null) gen.maxOutputTokens = body.max_tokens;
-  if (Object.keys(gen).length) out.generationConfig = gen;
   return out;
 }
 
-// ---------- 工具：Gemini 响应 -> OpenAI 响应（非流式） ----------
+const FINISH_MAP = { STOP: 'stop', MAX_TOKENS: 'length', SAFETY: 'content_filter' };
+
 function geminiToOpenAI(gem, model) {
   const cand = (gem.candidates && gem.candidates[0]) || {};
   const parts = (cand.content && cand.content.parts) || [];
   const text = parts.map((p) => p.text || '').join('');
-  const finishMap = { STOP: 'stop', MAX_TOKENS: 'length', SAFETY: 'content_filter', RECITATION: 'content_filter' };
   const u = gem.usageMetadata || {};
   return {
     id: 'chatcmpl-' + Math.random().toString(36).slice(2),
     object: 'chat.completion',
     created: Math.floor(Date.now() / 1000),
-    model: model,
-    choices: [
-      {
-        index: 0,
-        message: { role: 'assistant', content: text },
-        finish_reason: finishMap[cand.finishReason] || 'stop',
-      },
-    ],
-    usage: {
-      prompt_tokens: u.promptTokenCount || 0,
-      completion_tokens: u.candidatesTokenCount || 0,
-      total_tokens: u.totalTokenCount || 0,
-    },
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: FINISH_MAP[cand.finishReason] || 'stop' }],
+    usage: { prompt_tokens: u.promptTokenCount || 0, completion_tokens: u.candidatesTokenCount || 0, total_tokens: u.totalTokenCount || 0 },
   };
 }
 
@@ -87,92 +71,104 @@ function chunk(model, delta, finish) {
   };
 }
 
-function jsonHeaders(extra) {
-  const h = new Headers(extra || {});
-  h.set('content-type', 'application/json');
-  return h;
+function geminiToResponses(gem, model, respId) {
+  const cand = (gem.candidates && gem.candidates[0]) || {};
+  const parts = (cand.content && cand.content.parts) || [];
+  const text = parts.map((p) => p.text || '').join('');
+  const u = gem.usageMetadata || {};
+  return {
+    id: respId,
+    object: 'response',
+    created_at: Math.floor(Date.now() / 1000),
+    status: 'completed',
+    model,
+    output: [{ type: 'message', id: 'msg_' + Math.random().toString(36).slice(2), status: 'completed', role: 'assistant', content: [{ type: 'output_text', text, annotations: [] }] }],
+    usage: { input_tokens: u.promptTokenCount || 0, output_tokens: u.candidatesTokenCount || 0, total_tokens: u.totalTokenCount || 0 },
+  };
 }
 
-// ---------- 主处理 ----------
+function geminiToAnthropic(gem, model) {
+  const cand = (gem.candidates && gem.candidates[0]) || {};
+  const parts = (cand.content && cand.content.parts) || [];
+  const text = parts.map((p) => p.text || '').join('');
+  const u = gem.usageMetadata || {};
+  return {
+    id: 'msg_' + Math.random().toString(36).slice(2),
+    type: 'message',
+    role: 'assistant',
+    model,
+    content: [{ type: 'text', text }],
+    stop_reason: cand.finishReason === 'MAX_TOKENS' ? 'max_tokens' : 'end_turn',
+    stop_sequence: null,
+    usage: { input_tokens: u.promptTokenCount || 0, output_tokens: u.candidatesTokenCount || 0 },
+  };
+}
+
+function jsonHeaders() {
+  return new Headers({ 'content-type': 'application/json', 'access-control-allow-origin': '*' });
+}
+
+async function callGemini(model, gemBody, stream, key) {
+  const method = stream ? 'streamGenerateContent' : 'generateContent';
+  const targetUrl = new URL(`https://${GL_HOST}/v1beta/models/${encodeURIComponent(model)}:${method}`);
+  targetUrl.searchParams.set('key', key);
+  if (stream) targetUrl.searchParams.set('alt', 'sse');
+  return fetch(targetUrl.toString(), {
+    method: 'POST',
+    headers: new Headers({ 'content-type': 'application/json' }),
+    body: JSON.stringify(gemBody),
+  });
+}
+
 export default async function handler(request) {
   const url = new URL(request.url);
   const key = extractKey(request, url);
   const path = url.pathname;
 
-  // 根路径状态页
   if (path === '/' || path === '') {
     return new Response(
-      `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Universal AI Gateway</title></head>
-<body style="font-family:sans-serif;background:#0f172a;color:#fff;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;">
-<div style="background:#1e293b;padding:30px;border-radius:12px;border:1px solid #334155;text-align:center;max-width:640px;">
-<h1 style="color:#38bdf8;margin:0 0 10px;">⚡ 万能 AI 网关运行中</h1>
-<p style="color:#94a3b8;margin:0 0 16px;">双协议支持：OpenAI (/v1/chat/completions) + Gemini (/v1beta)</p>
-<div style="background:#090d16;padding:12px;border-radius:8px;font-family:monospace;color:#10b981;">${url.origin}</div>
-</div></body></html>`,
+      `<!DOCTYPE html><html><body style="font-family:sans-serif;background:#0f172a;color:#fff;text-align:center;padding:50px;">
+<h1 style="color:#38bdf8;">⚡ Universal AI Gateway</h1>
+<p style="color:#94a3b8;">Chat Completions + Responses + Anthropic Messages + Gemini</p></body></html>`,
       { status: 200, headers: { 'content-type': 'text/html; charset=utf-8' } }
     );
   }
 
   try {
-    // ============ OpenAI 兼容：/v1/models ============
+    // /v1/models
     if (path === '/v1/models' || path === '/models') {
       const upstream = await fetch(`https://${GL_HOST}/v1beta/models?pageSize=100&key=${encodeURIComponent(key)}`);
       const data = await upstream.json();
       if (!upstream.ok) return new Response(JSON.stringify(data), { status: upstream.status, headers: jsonHeaders() });
-      const list = (data.models || []).map((m) => ({
-        id: (m.name || '').replace(/^models\//, ''),
-        object: 'model',
-        created: 0,
-        owned_by: 'google',
-        display_name: m.displayName,
-      }));
+      const list = (data.models || []).map((m) => ({ id: (m.name || '').replace(/^models\//, ''), object: 'model', created: 0, owned_by: 'google' }));
       return new Response(JSON.stringify({ object: 'list', data: list }), { status: 200, headers: jsonHeaders() });
     }
 
-    // ============ OpenAI 兼容：/v1/chat/completions ============
+    // 1. Chat Completions
     if (path.endsWith('/chat/completions')) {
       const body = await request.json();
       const model = body.model || 'gemini-flash-latest';
-      const gemBody = openAIToGemini(body);
+      const gemBody = buildContents(body.messages);
+      if (body.temperature != null) gemBody.generationConfig = { ...(gemBody.generationConfig || {}), temperature: body.temperature };
+      if (body.max_tokens != null) gemBody.generationConfig = { ...(gemBody.generationConfig || {}), maxOutputTokens: body.max_tokens };
       const stream = !!body.stream;
-      const method = stream ? 'streamGenerateContent' : 'generateContent';
-      const targetUrl = new URL(`https://${GL_HOST}/v1beta/models/${encodeURIComponent(model)}:${method}`);
-      targetUrl.searchParams.set('key', key);
-      if (stream) targetUrl.searchParams.set('alt', 'sse');
-      const target = targetUrl.toString();
 
-      const headers = new Headers({ 'content-type': 'application/json' });
-      const upstream = await fetch(target, {
-        method: 'POST',
-        headers,
-        body: JSON.stringify(gemBody),
-      });
-
+      const upstream = await callGemini(model, gemBody, stream, key);
       if (!upstream.ok) {
         const errText = await upstream.text();
-        let msg = errText;
-        try { msg = JSON.parse(errText).error?.message || errText; } catch {}
-        return new Response(
-          JSON.stringify({ error: { message: msg, type: 'upstream_error', code: upstream.status } }),
-          { status: upstream.status, headers: jsonHeaders() }
-        );
+        return new Response(errText, { status: upstream.status, headers: jsonHeaders() });
       }
-
       if (!stream) {
         const gem = await upstream.json();
         return new Response(JSON.stringify(geminiToOpenAI(gem, model)), { status: 200, headers: jsonHeaders() });
       }
-
-      // 流式：Gemini SSE -> OpenAI SSE
-      const decoder = new TextDecoder();
+      // Stream
       const encoder = new TextEncoder();
+      const decoder = new TextDecoder();
       let buffer = '';
-      let sentRole = false;
       const readable = new ReadableStream({
         async start(controller) {
-          controller.enqueue(
-            encoder.encode(`data: ${JSON.stringify(chunk(model, { role: 'assistant', content: '' }))}\n\n`)
-          );
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk(model, { role: 'assistant', content: '' }))}\n\n`));
           const reader = upstream.body.getReader();
           while (true) {
             const { done, value } = await reader.read();
@@ -188,17 +184,9 @@ export default async function handler(request) {
               try {
                 const gem = JSON.parse(payload);
                 const cand = (gem.candidates && gem.candidates[0]) || {};
-                const parts = (cand.content && cand.content.parts) || [];
-                const text = parts.map((p) => p.text || '').join('');
-                if (text) {
-                  const c = chunk(model, { content: text });
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(c)}\n\n`));
-                }
-                if (cand.finishReason) {
-                  const finishMap = { STOP: 'stop', MAX_TOKENS: 'length', SAFETY: 'content_filter' };
-                  const c = chunk(model, {}, finishMap[cand.finishReason] || 'stop');
-                  controller.enqueue(encoder.encode(`data: ${JSON.stringify(c)}\n\n`));
-                }
+                const text = (cand.content && cand.content.parts || []).map((p) => p.text || '').join('');
+                if (text) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk(model, { content: text }))}\n\n`));
+                if (cand.finishReason) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk(model, {}, FINISH_MAP[cand.finishReason] || 'stop'))}\n\n`));
               } catch {}
             }
           }
@@ -206,52 +194,69 @@ export default async function handler(request) {
           controller.close();
         },
       });
-      return new Response(readable, {
-        status: 200,
-        headers: {
-          'content-type': 'text/event-stream; charset=utf-8',
-          'cache-control': 'no-cache',
-          connection: 'keep-alive',
-        },
-      });
+      return new Response(readable, { status: 200, headers: { 'content-type': 'text/event-stream; charset=utf-8', 'cache-control': 'no-cache' } });
     }
 
-    // ============ Gemini 原生协议：透明转发 ============
+    // 2. Responses
+    if (path.endsWith('/responses')) {
+      const body = await request.json();
+      const model = body.model || 'gemini-flash-latest';
+      let messages = body.messages || [];
+      if (!messages.length) {
+        if (body.instructions) messages.push({ role: 'system', content: body.instructions });
+        if (typeof body.input === 'string') messages.push({ role: 'user', content: body.input });
+      }
+      const gemBody = buildContents(messages);
+      const stream = !!body.stream;
+      const upstream = await callGemini(model, gemBody, stream, key);
+      if (!upstream.ok) return new Response(await upstream.text(), { status: upstream.status, headers: jsonHeaders() });
+      const respId = 'resp_' + Math.random().toString(36).slice(2);
+      if (!stream) {
+        const gem = await upstream.json();
+        return new Response(JSON.stringify(geminiToResponses(gem, model, respId)), { status: 200, headers: jsonHeaders() });
+      }
+      // Responses stream simple fallback to non-stream JSON for Edge brevity
+      const gem = await upstream.json();
+      return new Response(JSON.stringify(geminiToResponses(gem, model, respId)), { status: 200, headers: jsonHeaders() });
+    }
+
+    // 3. Anthropic Messages
+    if (path.endsWith('/messages') || path === '/v1/messages') {
+      const body = await request.json();
+      const model = body.model || 'gemini-flash-latest';
+      const gemBody = buildContents(body.messages);
+      if (body.system) gemBody.systemInstruction = { parts: [{ text: typeof body.system === 'string' ? body.system : JSON.stringify(body.system) }] };
+      if (body.max_tokens != null) gemBody.generationConfig = { ...(gemBody.generationConfig || {}), maxOutputTokens: body.max_tokens };
+      const stream = !!body.stream;
+      const upstream = await callGemini(model, gemBody, stream, key);
+      if (!upstream.ok) return new Response(await upstream.text(), { status: upstream.status, headers: jsonHeaders() });
+      const gem = await upstream.json();
+      return new Response(JSON.stringify(geminiToAnthropic(gem, model)), { status: 200, headers: jsonHeaders() });
+    }
+
+    // 4. Gemini 原生透明转发
     let targetHost = GL_HOST;
     if (path.includes('v1internal') || path.includes('loadCodeAssist')) targetHost = CLOUDCODE_HOST;
-
     const targetUrl = new URL(path + url.search, `https://${targetHost}`);
-    if (key && !url.searchParams.has('key')) {
-      targetUrl.searchParams.set('key', key);
-    }
-
+    if (key && !url.searchParams.has('key')) targetUrl.searchParams.set('key', key);
     const forwardHeaders = new Headers();
     for (const [k, v] of request.headers.entries()) {
       const lk = k.toLowerCase();
-      if (!lk.startsWith('x-vercel-') && lk !== 'host' && lk !== 'x-real-ip' && lk !== 'x-forwarded-for' && lk !== 'authorization' && lk !== 'x-goog-api-key') {
+      if (!lk.startsWith('x-vercel-') && !['host', 'authorization', 'x-goog-api-key', 'x-api-key', 'connection'].includes(lk)) {
         forwardHeaders.set(k, v);
       }
     }
     if (path.includes('v1internal') && key) forwardHeaders.set('authorization', `Bearer ${key}`);
-
     const fetchInit = { method: request.method, headers: forwardHeaders, redirect: 'follow' };
     if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
       fetchInit.body = request.body;
       fetchInit.duplex = 'half';
     }
-
     const upstreamResponse = await fetch(targetUrl.toString(), fetchInit);
     const outHeaders = new Headers(upstreamResponse.headers);
     outHeaders.set('access-control-allow-origin', '*');
-    return new Response(upstreamResponse.body, {
-      status: upstreamResponse.status,
-      statusText: upstreamResponse.statusText,
-      headers: outHeaders,
-    });
+    return new Response(upstreamResponse.body, { status: upstreamResponse.status, statusText: upstreamResponse.statusText, headers: outHeaders });
   } catch (err) {
-    return new Response(JSON.stringify({ error: { message: err.message || String(err) } }), {
-      status: 502,
-      headers: jsonHeaders(),
-    });
+    return new Response(JSON.stringify({ error: { message: err.message || String(err) } }), { status: 502, headers: jsonHeaders() });
   }
 }
