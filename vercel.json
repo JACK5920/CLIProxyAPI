@@ -2,19 +2,7 @@
   "version": 2,
   "routes": [
     {
-      "src": "/proxy/(.*)",
-      "dest": "/api/proxy"
-    },
-    {
-      "src": "/v1internal/(.*)",
-      "dest": "/api/proxy"
-    },
-    {
-      "src": "/v1beta/(.*)",
-      "dest": "/api/proxy"
-    },
-    {
-      "src": "/v1/(.*)",
+      "src": "/(.*)",
       "dest": "/api/proxy"
     }
   ]
