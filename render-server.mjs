@@ -168,11 +168,13 @@ async function readBody(req) {
 async function callGemini(model, gemBody, stream, key) {
   const method = stream ? 'streamGenerateContent' : 'generateContent';
   const targetUrl = new URL(`https://${GL_HOST}/v1beta/models/${encodeURIComponent(model)}:${method}`);
-  targetUrl.searchParams.set('key', key);
+  if (key) targetUrl.searchParams.set('key', key);
   if (stream) targetUrl.searchParams.set('alt', 'sse');
+  const headers = { 'content-type': 'application/json' };
+  if (key) headers['x-goog-api-key'] = key;
   return fetch(targetUrl.toString(), {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers,
     body: JSON.stringify(gemBody),
   });
 }
