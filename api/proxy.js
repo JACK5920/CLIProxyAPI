@@ -25,13 +25,18 @@ export default async function handler(request) {
   headers.delete('x-vercel-ip-city');
 
   try {
-    const response = await fetch(targetUrl.toString(), {
+    const fetchOptions = {
       method: request.method,
       headers: headers,
-      body: ['GET', 'HEAD'].includes(request.method) ? undefined : request.body,
-      duplex: 'half',
       redirect: 'follow',
-    });
+    };
+
+    if (!['GET', 'HEAD'].includes(request.method)) {
+      fetchOptions.body = request.body;
+      fetchOptions.duplex = 'half';
+    }
+
+    const response = await fetch(targetUrl.toString(), fetchOptions);
 
     const responseHeaders = new Headers(response.headers);
     responseHeaders.set('Access-Control-Allow-Origin', '*');
