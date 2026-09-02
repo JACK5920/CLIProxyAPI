@@ -1,37 +1,35 @@
 export const config = {
   runtime: 'edge',
-  regions: ['sfo1', 'iad1'], // 强制调度到美国旧金山/美东机房
+  regions: ['sfo1', 'iad1'],
 };
 
 export default async function handler(request) {
-  const url = new URL(request.url);
-
-  // 路由分流：
-  // 1. Antigravity / Cloud Code (/v1internal) -> cloudcode-pa.googleapis.com
-  // 2. Gemini API (/v1beta, /v1) -> generativelanguage.googleapis.com
-  let targetHost = 'generativelanguage.googleapis.com';
-  if (url.pathname.includes('/v1internal') || url.pathname.includes('loadCodeAssist')) {
-    targetHost = 'cloudcode-pa.googleapis.com';
-  }
-
-  const targetUrl = new URL(url.pathname + url.search, `https://${targetHost}`);
-
-  // 清洗客户端地域头，防止地理位置泄漏
-  const headers = new Headers(request.headers);
-  headers.set('host', targetHost);
-  headers.delete('x-real-ip');
-  headers.delete('x-forwarded-for');
-  headers.delete('x-vercel-ip-country');
-  headers.delete('x-vercel-ip-city');
-
   try {
+    const url = new URL(request.url);
+
+    let targetHost = 'generativelanguage.googleapis.com';
+    if (url.pathname.includes('v1internal') || url.pathname.includes('loadCodeAssist')) {
+      targetHost = 'cloudcode-pa.googleapis.com';
+    }
+
+    const targetUrl = new URL(url.pathname + url.search, `https://${targetHost}`);
+
+    const headers = new Headers();
+    for (const [key, value] of request.headers.entries()) {
+      const lowerKey = key.toLowerCase();
+      if (!lowerKey.startsWith('x-vercel-') && lowerKey !== 'x-real-ip' && lowerKey !== 'x-forwarded-for' && lowerKey !== 'host') {
+        headers.set(key, value);
+      }
+    }
+    headers.set('host', targetHost);
+
     const fetchOptions = {
       method: request.method,
       headers: headers,
       redirect: 'follow',
     };
 
-    if (!['GET', 'HEAD'].includes(request.method)) {
+    if (!['GET', 'HEAD'].includes(request.method.toUpperCase())) {
       fetchOptions.body = request.body;
       fetchOptions.duplex = 'half';
     }
@@ -49,7 +47,11 @@ export default async function handler(request) {
       headers: responseHeaders,
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: error.message }), {
+    return new Response(JSON.stringify({ 
+      error: error.message, 
+      stack: error.stack,
+      hint: "Vercel Edge Proxy Internal Error" 
+    }), {
       status: 502,
       headers: { 'content-type': 'application/json' },
     });
